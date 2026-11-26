@@ -14,6 +14,7 @@ found at `in-toto.io <https://in-toto.io>`_.
    command-line-tools/index
    api
    model
+   grouped-threshold
    configuration
    layout-creation-example
    Demo Supply Chain <https://github.com/in-toto/demo>

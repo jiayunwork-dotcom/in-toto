@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Added
+* Optional `grouped` layout threshold mode (`threshold_mode`): links with
+  conflicting artifacts may coexist; verification searches for one
+  threshold-satisfying link group per step such that all artifact rules,
+  including cross-step MATCH rules, hold on a single chain-wide selection,
+  and exposes the selection as a queryable proof
+  (`in_toto.groupedthreshold`). The mode is part of the signed layout;
+  legacy mode-less layouts keep their exact signable bytes.
+
 ## v3.0.0
 
 This release, most notably, marks stable securesystemslib v1.0.0 as minimum

@@ -61,6 +61,27 @@ from in_toto.models.common import Signable, ValidationMixin
 # with the following name, relative to the verification directory
 SUBLAYOUT_LINK_DIR_FORMAT = "{name}.{keyid:.8}"
 
+# Threshold verification modes
+#
+# THRESHOLD_MODE_STRICT:
+#   The traditional (and default) behavior. All links counted towards a
+#   step's threshold must report identical materials and products, otherwise
+#   verification fails. This mode is implicit: it is not serialized in the
+#   layout, so layouts signed before the threshold mode field existed keep
+#   their exact signable bytes and signatures.
+#
+# THRESHOLD_MODE_GROUPED:
+#   Opt-in alternative for the supply chain owner. Links reporting different
+#   artifacts may coexist. The verifier groups links per step by identical
+#   materials and products and searches for one threshold-satisfying group per
+#   step such that all artifact rules (including cross-step MATCH rules) hold
+#   on the same selection. The mode is part of the signed layout payload and
+#   therefore cannot be relaxed by a verifier without invalidating the layout
+#   signatures.
+THRESHOLD_MODE_STRICT = "strict"
+THRESHOLD_MODE_GROUPED = "grouped"
+THRESHOLD_MODES = (THRESHOLD_MODE_STRICT, THRESHOLD_MODE_GROUPED)
+
 
 @attr.s(repr=False, init=False)
 class Layout(Signable):
@@ -86,6 +107,14 @@ class Layout(Signable):
 
       readme: A human readable description of the software supply chain.
 
+      threshold_mode: The threshold verification mode, either
+          ``THRESHOLD_MODE_STRICT`` (default, traditional all-links-must-agree
+          behavior) or ``THRESHOLD_MODE_GROUPED`` (conflicting links may
+          coexist, one threshold-satisfying group is selected per step under a
+          single chain-wide artifact rule solution). The mode is part of the
+          signed payload; the default strict mode is not serialized, so legacy
+          layouts remain byte-identical.
+
     """
 
     # pylint: disable=too-many-instance-attributes
@@ -104,6 +133,14 @@ class Layout(Signable):
         self.keys = kwargs.get("keys", {})
         self.readme = kwargs.get("readme", "")
 
+        # NOTE: The threshold mode is intentionally not an attrs attribute. It
+        # is only added to the serialized (signed) payload when explicitly set
+        # to a non-default mode, keeping the canonical representation of
+        # existing mode-less layouts unchanged.
+        self.threshold_mode = kwargs.get(
+            "threshold_mode", THRESHOLD_MODE_STRICT
+        )
+
         # Assign a default expiration (one month) if not expiration date is passed
         # TODO: Is one month a sensible default? In any case, we need a valid
         # expiration date in order for the layout object to validate.
@@ -115,6 +152,31 @@ class Layout(Signable):
         # TODO: Should we validate in the constructor or allow the user to create
         # an invalid layout and call validate explicitly?
         self.validate()
+
+    @property
+    def threshold_mode(self):
+        """The threshold verification mode of this layout.
+
+        One of ``THRESHOLD_MODE_STRICT`` or ``THRESHOLD_MODE_GROUPED``.
+        """
+        return self._threshold_mode
+
+    @threshold_mode.setter
+    def threshold_mode(self, threshold_mode):
+        self._threshold_mode = threshold_mode
+
+    def to_dict(self):
+        """Return the JSON-serializable dict representation.
+
+        The optional ``threshold_mode`` field is only included when the
+        non-default grouped mode is selected, so that legacy layouts keep
+        their exact canonical representation and remain verifiable with their
+        existing signatures.
+        """
+        data = attr.asdict(self)
+        if self._threshold_mode == THRESHOLD_MODE_GROUPED:
+            data["threshold_mode"] = THRESHOLD_MODE_GROUPED
+        return data
 
     @property
     def type_(self):
@@ -150,6 +212,8 @@ class Layout(Signable):
             inspections.append(Inspection.read(inspect_data))
         data["inspect"] = inspections
 
+        # The optional "threshold_mode" field is passed through to the
+        # constructor if present; a mode-less layout defaults to strict mode.
         return Layout(**data)
 
     def set_relative_expiration(self, days=0, months=0, years=0):
@@ -437,6 +501,15 @@ class Layout(Signable):
             raise securesystemslib.exceptions.FormatError(
                 "Invalid readme '{}', value must be a string.".format(
                     self.readme
+                )
+            )
+
+    def _validate_threshold_mode(self):
+        """Private method to check that the threshold mode is supported."""
+        if self.threshold_mode not in THRESHOLD_MODES:
+            raise securesystemslib.exceptions.FormatError(
+                "Invalid threshold_mode '{}', value must be one of {}.".format(
+                    self.threshold_mode, THRESHOLD_MODES
                 )
             )
 
