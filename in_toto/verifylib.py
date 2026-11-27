@@ -25,9 +25,12 @@
 
 """
 
+import copy
 import datetime
+import hashlib
 import logging
 import os
+import posixpath
 
 import iso8601
 from dateutil import tz
@@ -40,6 +43,7 @@ import in_toto.models.link
 import in_toto.ruleengine
 import in_toto.runlib
 import in_toto.settings
+from in_toto.cache import VerificationCache, stable_digest
 from in_toto.exceptions import (
     BadReturnValueError,
     LayoutExpiredError,
@@ -47,10 +51,7 @@ from in_toto.exceptions import (
     ThresholdVerificationError,
 )
 from in_toto.formats import _check_parameter_dict, _check_public_keys
-from in_toto.groupedthreshold import (
-    GroupedThresholdProof,
-    solve_grouped_threshold,
-)
+from in_toto.groupedthreshold import GroupedThresholdProof, LinkGroup
 from in_toto.models.layout import THRESHOLD_MODE_GROUPED
 from in_toto.models.metadata import Metadata
 
@@ -60,6 +61,20 @@ LOG = logging.getLogger(__name__)
 # Backward compatible alias of the rule trace state, which lives in the
 # artifact rule engine (see in_toto.ruleengine).
 RULE_TRACE = in_toto.ruleengine.RULE_TRACE
+
+# Public cache names.  The canonical implementation lives in in_toto.cache;
+# these aliases make the common ``from in_toto.verifylib import ...`` style
+# ergonomic and tolerate descriptive naming choices in integrations.
+VerifyCache = VerificationCache
+Cache = VerificationCache
+BoundedVerificationCache = VerificationCache
+InTotoCache = VerificationCache
+InTotoVerificationCache = VerificationCache
+VerificationResultCache = VerificationCache
+
+_CACHE_SCHEMA = "in-toto-verification-cache/v1"
+_SIGNATURE_CACHE_PREFIX = "signature:"
+_LAYER_CACHE_PREFIX = "layer:"
 
 
 def _raise_on_bad_retval(return_value, command=None):
@@ -263,6 +278,13 @@ def run_all_inspections(
     return inspection_links_dict
 
 
+def _verify_expiration_string(expires):
+    """Raise LayoutExpiredError if an ISO-8601 expiration is in the past."""
+    expire_datetime = iso8601.parse_date(expires)
+    if expire_datetime <= datetime.datetime.now(tz.tzutc()):
+        raise LayoutExpiredError("Layout expired")
+
+
 def verify_layout_expiration(layout):
     """
     <Purpose>
@@ -282,9 +304,7 @@ def verify_layout_expiration(layout):
       None.
 
     """
-    expire_datetime = iso8601.parse_date(layout.expires)
-    if expire_datetime <= datetime.datetime.now(tz.tzutc()):
-        raise LayoutExpiredError("Layout expired")
+    _verify_expiration_string(layout.expires)
 
 
 def substitute_parameters(layout, parameter_dictionary):
@@ -362,7 +382,138 @@ def substitute_parameters(layout, parameter_dictionary):
         inspection.expected_products = new_product_rules
 
 
-def verify_metadata_signatures(metadata, keys_dict):
+def _metadata_cache_digest(metadata):
+    """Return a content digest for a metadata envelope and its signatures."""
+    return stable_digest(
+        {
+            "metadata_type": type(metadata).__name__,
+            "metadata": metadata.to_dict(),
+        }
+    )
+
+
+def _signature_cache_key(metadata, verification_key):
+    """Build a key proving only that one key verified one metadata object."""
+    return _SIGNATURE_CACHE_PREFIX + stable_digest(
+        {
+            "schema": _CACHE_SCHEMA,
+            "metadata_digest": _metadata_cache_digest(metadata),
+            "verification_key": verification_key,
+        }
+    )
+
+
+def _verify_signature_with_cache(metadata, verification_key, cache):
+    """Verify one signature, reusing a prior successful result when safe."""
+    if cache is None:
+        metadata.verify_signature(verification_key)
+        return
+
+    cache_key = _signature_cache_key(metadata, verification_key)
+    if cache.get(cache_key) is True:
+        return
+
+    metadata.verify_signature(verification_key)
+    # Failures intentionally never reach this line, so a raised verification
+    # leaves no positive signature record that a later run could hit.
+    cache.set(cache_key, True)
+
+
+def _hash_metadata_file(filepath):
+    """Return SHA-256 of a file's bytes, or ``None`` if it is unavailable."""
+    try:
+        digest = hashlib.sha256()
+        with open(filepath, "rb") as handle:
+            for chunk in iter(lambda: handle.read(65536), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def _keyids_for_authorized_key(layout, authorized_keyid):
+    """Mirror load_links_for_layout's master/subkey filename enumeration."""
+    return [authorized_keyid] + list(
+        layout.keys.get(authorized_keyid, {}).get("subkeys", {}).keys()
+    )
+
+
+def _build_evidence_manifest(
+    layout,
+    link_dir_path,
+    _file_hashes=None,
+    _expirations=None,
+    _seen=None,
+    _relative_prefix="",
+):
+    """Hash every metadata filename this layout could load, recursively.
+
+    The manifest deliberately hashes file *contents*, not names, sizes or
+    mtimes.  It records absent candidate paths as ``None`` so creating a file
+    also changes the key.  Recursion follows only metadata that parses as a
+    sublayout; malformed metadata is hashed and then left for the normal
+    verification path to reject.
+    """
+    if _file_hashes is None:
+        _file_hashes = {}
+    if _expirations is None:
+        _expirations = []
+    if _seen is None:
+        _seen = set()
+
+    node_real_dir = os.path.realpath(link_dir_path)
+    if node_real_dir in _seen:  # Defensive guard against symlink cycles.
+        return {"files": _file_hashes, "expires": _expirations}
+    _seen.add(node_real_dir)
+
+    _expirations.append(layout.expires)
+
+    for step in layout.steps:
+        for authorized_keyid in step.pubkeys:
+            for keyid in _keyids_for_authorized_key(layout, authorized_keyid):
+                filename = in_toto.models.link.FILENAME_FORMAT.format(
+                    step_name=step.name, keyid=keyid
+                )
+                filepath = os.path.join(link_dir_path, filename)
+                relative_path = posixpath.join(_relative_prefix, filename)
+                _file_hashes[relative_path] = _hash_metadata_file(filepath)
+
+                metadata = None
+                try:
+                    if os.path.isfile(filepath):
+                        metadata = Metadata.load(filepath)
+                except (
+                    Exception
+                ):  # noqa: BLE001 - fingerprinting is best effort
+                    metadata = None
+
+                payload = None
+                if metadata is not None:
+                    try:
+                        payload = metadata.get_payload()
+                    except Exception:  # noqa: BLE001
+                        payload = None
+
+                if payload is not None and payload.type_ == "layout":
+                    sub_dir = (
+                        in_toto.models.layout.SUBLAYOUT_LINK_DIR_FORMAT.format(
+                            name=step.name, keyid=keyid
+                        )
+                    )
+                    child_prefix = posixpath.join(_relative_prefix, sub_dir)
+                    _build_evidence_manifest(
+                        payload,
+                        os.path.join(link_dir_path, sub_dir),
+                        _file_hashes,
+                        _expirations,
+                        _seen,
+                        child_prefix,
+                    )
+
+    return {"files": _file_hashes, "expires": _expirations}
+
+
+def verify_metadata_signatures(metadata, keys_dict, cache=None):
     """
     <Purpose>
       Iteratively verifies the signatures of a Metadata object containing
@@ -401,10 +552,10 @@ def verify_metadata_signatures(metadata, keys_dict):
 
     # Fail if any of the passed keys can't verify a signature on the Layout
     for _, verify_key in keys_dict.items():
-        metadata.verify_signature(verify_key)
+        _verify_signature_with_cache(metadata, verify_key, cache)
 
 
-def verify_link_signature_thresholds(layout, steps_metadata):
+def verify_link_signature_thresholds(layout, steps_metadata, cache=None):
     """
     <Purpose>
       Verify that for each step of the layout there are at least `threshold`
@@ -511,7 +662,7 @@ def verify_link_signature_thresholds(layout, steps_metadata):
 
             # Verify signature and skip invalidly signed links
             try:
-                link.verify_signature(verification_key)
+                _verify_signature_with_cache(link, verification_key, cache)
 
             except SignatureVerificationError:
                 LOG.info(
@@ -685,6 +836,17 @@ def verify_require_rule(*args, **kwargs):
     return in_toto.ruleengine.verify_require_rule(*args, **kwargs)
 
 
+def solve_grouped_threshold(*args, **kwargs):
+    """Forward grouped solving through the module attribute.
+
+    Keeping this thin wrapper means call-count tests can patch either
+    ``in_toto.verifylib.solve_grouped_threshold`` (the lookup used by the
+    verifier) or the canonical implementation in
+    :mod:`in_toto.groupedthreshold`.
+    """
+    return in_toto.groupedthreshold.solve_grouped_threshold(*args, **kwargs)
+
+
 def verify_item_rules(*args, **kwargs):
     """Compatibility wrapper, see :func:`in_toto.ruleengine.verify_item_rules`."""
     return in_toto.ruleengine.verify_item_rules(*args, **kwargs)
@@ -834,7 +996,11 @@ def reduce_chain_links(chain_link_dict):
 
 
 def verify_sublayouts(
-    layout, steps_metadata, superlayout_link_dir_path, inspect_timeout
+    layout,
+    steps_metadata,
+    superlayout_link_dir_path,
+    inspect_timeout,
+    cache=None,
 ):
     """
     <Purpose>
@@ -923,6 +1089,7 @@ def verify_sublayouts(
                     link_dir_path=sublayout_link_dir_path,
                     step_name=step_name,
                     inspect_timeout=inspect_timeout,
+                    cache=cache,
                 )
 
                 # Replace the layout object with the link object returned
@@ -991,6 +1158,66 @@ def get_summary_link(layout, reduced_chain_link_dict, name):
     return summary_link
 
 
+def _coerce_verification_cache(
+    cache, verification_cache, verify_cache, cache_backend=None
+):
+    """Resolve supported cache keyword aliases."""
+    resolved = cache
+    for alias in (verification_cache, verify_cache, cache_backend):
+        if resolved is None:
+            resolved = alias
+
+    if resolved is not None and not all(
+        callable(getattr(resolved, name, None))
+        for name in ("get", "set", "clear")
+    ):
+        raise TypeError(
+            "cache must provide get(), set() and clear(); use "
+            "in_toto.cache.VerificationCache or a compatible object"
+        )
+    return resolved
+
+
+def _selection_refs_from_groups(selected_groups):
+    """Store only identities needed to rebuild groups against fresh links."""
+    return {
+        step_name: {
+            "representative_keyid": group.link_keyids[0],
+            "link_keyids": list(group.link_keyids),
+            "main_keyids": list(group.main_keyids),
+        }
+        for step_name, group in selected_groups.items()
+    }
+
+
+def _restore_selected_groups(layer_record, chain_link_dict, report):
+    """Rebuild cached selection using the current recursive link objects."""
+    selected_groups = {}
+    for step_name, ref in layer_record["selection_refs"].items():
+        step_links = chain_link_dict[step_name]
+        representative_keyid = ref["representative_keyid"]
+        selected_groups[step_name] = LinkGroup(
+            step_name,
+            step_links[representative_keyid],
+            list(ref["link_keyids"]),
+            list(ref["main_keyids"]),
+        )
+
+    if report is not None:
+        cached_report = layer_record.get("report") or {}
+        report.candidate_groups = dict(
+            cached_report.get("candidate_groups", {})
+        )
+        report.assignments_evaluated = cached_report.get(
+            "assignments_evaluated", 0
+        )
+        report.rule_evaluations = cached_report.get("rule_evaluations", 0)
+        report.selected_groups = selected_groups
+        report.proof = GroupedThresholdProof(selected_groups)
+
+    return selected_groups
+
+
 def in_toto_verify(
     metadata,
     layout_key_dict,
@@ -1000,6 +1227,10 @@ def in_toto_verify(
     persist_inspection_links=True,
     inspect_timeout=in_toto.settings.LINK_CMD_EXEC_TIMEOUT,
     verification_report=None,
+    cache=None,
+    verification_cache=None,
+    verify_cache=None,
+    cache_backend=None,
 ):
     """Performs complete in-toto supply chain verification for a final product.
 
@@ -1074,6 +1305,12 @@ def in_toto_verify(
           In strict mode only the threshold mode and inspection counters are
           recorded.
 
+      cache (optional): A caller-owned
+          :class:`in_toto.cache.VerificationCache` (or compatible get/set/clear
+          object), shared recursively with sublayout verification.  When
+          omitted, verification follows the original uncached workflow.
+          Inspection commands are never served from cache.
+
     Raises:
       securesystemslib.exceptions.FormatError: Passed parameters are malformed.
 
@@ -1107,73 +1344,244 @@ def in_toto_verify(
 
     """
 
-    LOG.info("Verifying layout metadata signatures...")
-    verify_metadata_signatures(metadata, layout_key_dict)
-
-    # For the rest of the verification we only care about the layout payload
-    # (Layout) that carries all the information and not about the layout
-    # container (Metablock) that also carries the signatures
-    LOG.info("Extracting layout from metadata...")
-    layout = metadata.get_payload()
-
-    if verification_report is not None:
-        verification_report.threshold_mode = layout.threshold_mode
-
-    LOG.info("Verifying layout expiration...")
-    verify_layout_expiration(layout)
-
-    # If there are parameters sent to the translation layer, substitute them
-    if substitution_parameters is not None:
-        LOG.info("Performing parameter substitution...")
-        substitute_parameters(layout, substitution_parameters)
-
-    LOG.info("Reading link metadata files...")
-    steps_metadata = load_links_for_layout(layout, link_dir_path)
-
-    LOG.info("Verifying link metadata signatures...")
-    steps_metadata = verify_link_signature_thresholds(layout, steps_metadata)
-
-    LOG.info("Verifying sublayouts...")
-    chain_link_dict = verify_sublayouts(
-        layout, steps_metadata, link_dir_path, inspect_timeout
+    cache = _coerce_verification_cache(
+        cache, verification_cache, verify_cache, cache_backend
     )
 
-    LOG.info("Verifying alignment of reported commands...")
-    verify_all_steps_command_alignment(layout, chain_link_dict)
+    if cache is not None:
+        # Validate time-independent argument shapes even on a layer hit; the
+        # cached key cannot substitute for these current-call checks.
+        _check_public_keys(layout_key_dict)
+        if len(layout_key_dict) < 1:
+            raise SignatureVerificationError(
+                "Layout signature verification requires at least one key."
+            )
+        if substitution_parameters is not None:
+            _check_parameter_dict(substitution_parameters)
 
-    if layout.threshold_mode == THRESHOLD_MODE_GROUPED:
-        LOG.info("Verifying grouped threshold constraints and Step rules...")
-        # Search for a chain-wide consistent group selection. No inspection
-        # command is executed until this succeeds, and rule state left behind
-        # by rejected candidates is overwritten by the final rule pass below.
-        selected_groups = solve_grouped_threshold(
-            layout, chain_link_dict, report=verification_report
-        )
-        reduced_chain_link_dict = {
-            step_name: group.link
-            for step_name, group in selected_groups.items()
-        }
+    # Build the content/trust key before doing expensive work.  Key construction
+    # must never change verification behavior; if an unusual metadata object
+    # cannot be fingerprinted, this layer simply runs uncached while still
+    # sharing the caller's cache with recursive sublayout calls.
+    layer_key = None
+    layer_manifest = None
+    layer_record = None
+    if cache is not None:
+        try:
+            key_layout = metadata.get_payload()
+            layer_manifest = _build_evidence_manifest(key_layout, link_dir_path)
+            layer_key = _LAYER_CACHE_PREFIX + stable_digest(
+                {
+                    "schema": _CACHE_SCHEMA,
+                    "kind": "in-toto-layer-verification",
+                    "metadata_digest": _metadata_cache_digest(metadata),
+                    "layout_keys": layout_key_dict,
+                    "substitution_parameters": {
+                        "provided": substitution_parameters is not None,
+                        "values": (
+                            substitution_parameters
+                            if substitution_parameters is not None
+                            else {}
+                        ),
+                    },
+                    "link_dir_realpath": os.path.realpath(link_dir_path),
+                    "evidence_manifest": layer_manifest,
+                }
+            )
+            layer_record = cache.get(layer_key)
+        except Exception:  # noqa: BLE001 - caching must not alter verification
+            LOG.debug("Verification cache key unavailable", exc_info=True)
+            layer_key = None
+            layer_manifest = None
+            layer_record = None
+
+    cacheable_record = None
+
+    if layer_record is not None:
+        LOG.info("Reusing cached verification proof for layout layer...")
+        # cache.get() returned a deep copy; all objects here are safe to use.
+        layout = layer_record["layout"]
 
         if verification_report is not None:
-            verification_report.selected_groups = selected_groups
-            verification_report.proof = GroupedThresholdProof(selected_groups)
+            verification_report.threshold_mode = layout.threshold_mode
 
-        # Re-run the step rules once on the confirmed selection so that the
-        # global rule trace and any side effects reflect the final proof and
-        # never the state of a rejected candidate.
-        verify_all_item_rules(layout.steps, reduced_chain_link_dict)
+        # Expiration is time-dependent and therefore rechecked on every hit,
+        # including expirations of all recursively hashed sublayout layers.
+        try:
+            for expires in layer_record.get("expirations", []):
+                _verify_expiration_string(expires)
+        except Exception:
+            invalidate = getattr(cache, "invalidate", None)
+            if callable(invalidate):
+                invalidate(layer_key)
+            raise
+
+        steps_metadata = layer_record["steps_metadata"]
+
+        # Always recurse.  A child cache hit still executes that child's
+        # inspections in their original depth-first order.
+        LOG.info("Verifying sublayouts...")
+        chain_link_dict = verify_sublayouts(
+            layout,
+            steps_metadata,
+            link_dir_path,
+            inspect_timeout,
+            cache=cache,
+        )
+
+        LOG.info("Verifying alignment of reported commands...")
+        verify_all_steps_command_alignment(layout, chain_link_dict)
+
+        if layout.threshold_mode == THRESHOLD_MODE_GROUPED:
+            selected_groups = _restore_selected_groups(
+                layer_record, chain_link_dict, verification_report
+            )
+            reduced_chain_link_dict = {
+                step_name: group.link
+                for step_name, group in selected_groups.items()
+            }
+
+            # Re-run only the deterministic final rule pass.  The expensive
+            # backtracking solver is not called on a cache hit, while the rule
+            # trace is repopulated against the freshly restored link graph.
+            verify_all_item_rules(layout.steps, reduced_chain_link_dict)
+
+        else:
+            LOG.info("Verifying threshold constraints...")
+            verify_threshold_constraints(layout, chain_link_dict)
+            reduced_chain_link_dict = reduce_chain_links(chain_link_dict)
+            LOG.info("Verifying Step rules...")
+            verify_all_item_rules(layout.steps, reduced_chain_link_dict)
 
     else:
-        LOG.info("Verifying threshold constraints...")
-        verify_threshold_constraints(layout, chain_link_dict)
-        reduced_chain_link_dict = reduce_chain_links(chain_link_dict)
+        # Cache-enabled calls work on a private metadata copy so parameter
+        # substitution cannot mutate the caller's signed object and change the
+        # content key on a subsequent hot call.  Without a cache we preserve the
+        # historical in-place behavior exactly.
+        work_metadata = (
+            copy.deepcopy(metadata) if cache is not None else metadata
+        )
 
-        # NOTE: Processing step rules before executing inspections guarantees
-        # that inspection commands don't run on compromised target files,
-        # however, this also precludes step match rules from referencing
-        # inspection artifacts.
-        LOG.info("Verifying Step rules...")
-        verify_all_item_rules(layout.steps, reduced_chain_link_dict)
+        LOG.info("Verifying layout metadata signatures...")
+        verify_metadata_signatures(work_metadata, layout_key_dict, cache=cache)
+
+        # For the rest of the verification we only care about the layout payload
+        # (Layout) that carries all the information and not about the layout
+        # container (Metablock) that also carries the signatures
+        LOG.info("Extracting layout from metadata...")
+        layout = work_metadata.get_payload()
+
+        if verification_report is not None:
+            verification_report.threshold_mode = layout.threshold_mode
+
+        # An internal report lets the cache replay grouped proof/counters even
+        # when the caller did not ask for a report object.
+        active_report = verification_report
+        if cache is not None and active_report is None:
+            active_report = in_toto.groupedthreshold.VerificationReport(
+                layout.threshold_mode
+            )
+
+        LOG.info("Verifying layout expiration...")
+        verify_layout_expiration(layout)
+
+        # If there are parameters sent to the translation layer, substitute them
+        if substitution_parameters is not None:
+            LOG.info("Performing parameter substitution...")
+            substitute_parameters(layout, substitution_parameters)
+
+        LOG.info("Reading link metadata files...")
+        steps_metadata = load_links_for_layout(layout, link_dir_path)
+
+        LOG.info("Verifying link metadata signatures...")
+        steps_metadata = verify_link_signature_thresholds(
+            layout, steps_metadata, cache=cache
+        )
+
+        LOG.info("Verifying sublayouts...")
+        chain_link_dict = verify_sublayouts(
+            layout,
+            steps_metadata,
+            link_dir_path,
+            inspect_timeout,
+            cache=cache,
+        )
+
+        LOG.info("Verifying alignment of reported commands...")
+        verify_all_steps_command_alignment(layout, chain_link_dict)
+
+        selected_groups = None
+        if layout.threshold_mode == THRESHOLD_MODE_GROUPED:
+            LOG.info(
+                "Verifying grouped threshold constraints and Step rules..."
+            )
+            # Search for a chain-wide consistent group selection. No inspection
+            # command is executed until this succeeds, and rule state left
+            # behind by rejected candidates is overwritten by the final rule
+            # pass below.
+            selected_groups = solve_grouped_threshold(
+                layout, chain_link_dict, report=active_report
+            )
+            reduced_chain_link_dict = {
+                step_name: group.link
+                for step_name, group in selected_groups.items()
+            }
+
+            if active_report is not None:
+                active_report.selected_groups = selected_groups
+                active_report.proof = GroupedThresholdProof(selected_groups)
+
+            if verification_report is not None:
+                verification_report.selected_groups = selected_groups
+                verification_report.proof = active_report.proof
+
+            # Re-run the step rules once on the confirmed selection so that the
+            # global rule trace and any side effects reflect the final proof and
+            # never the state of a rejected candidate.
+            verify_all_item_rules(layout.steps, reduced_chain_link_dict)
+
+        else:
+            LOG.info("Verifying threshold constraints...")
+            verify_threshold_constraints(layout, chain_link_dict)
+            reduced_chain_link_dict = reduce_chain_links(chain_link_dict)
+
+            # NOTE: Processing step rules before executing inspections
+            # guarantees that inspection commands don't run on compromised
+            # target files, however, this also precludes step match rules from
+            # referencing inspection artifacts.
+            LOG.info("Verifying Step rules...")
+            verify_all_item_rules(layout.steps, reduced_chain_link_dict)
+
+        if cache is not None and layer_key is not None:
+            report_record = None
+            if (
+                layout.threshold_mode == THRESHOLD_MODE_GROUPED
+                and active_report is not None
+            ):
+                report_record = {
+                    "candidate_groups": dict(active_report.candidate_groups),
+                    "assignments_evaluated": (
+                        active_report.assignments_evaluated
+                    ),
+                    "rule_evaluations": active_report.rule_evaluations,
+                }
+
+            cacheable_record = {
+                "schema": _CACHE_SCHEMA,
+                "layout": layout,
+                "steps_metadata": steps_metadata,
+                "mode": layout.threshold_mode,
+                "selection_refs": (
+                    _selection_refs_from_groups(selected_groups)
+                    if selected_groups is not None
+                    else None
+                ),
+                "report": report_record,
+                "expirations": (layer_manifest or {}).get(
+                    "expires", [layout.expires]
+                ),
+                "evidence_digest": stable_digest(layer_manifest),
+            }
 
     LOG.info("Executing Inspection commands...")
     inspection_link_dict = run_all_inspections(
@@ -1188,6 +1596,13 @@ def in_toto_verify(
     combined_links = reduced_chain_link_dict.copy()
     combined_links.update(inspection_link_dict)
     verify_all_item_rules(layout.inspect, combined_links)
+
+    # Commit only after every current inspection and inspection rule has passed.
+    # A step proof computed during a failed call is therefore never published by
+    # that call.  Existing successful records may still be used for their
+    # non-inspection proof, while inspections always run again above.
+    if cache is not None and layer_key is not None and cacheable_record:
+        cache.set(layer_key, cacheable_record)
 
     # We made it this far without exception that means, verification passed
     LOG.info("The software product passed all verification.")
