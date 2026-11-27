@@ -1,13 +1,47 @@
-"""Resolver interface and implementations for files, OSTree, and directory
-artifacts."""
+# Copyright New York University and the in-toto contributors
+# SPDX-License-Identifier: Apache-2.0
 
+"""Resolver interface and implementations for files, OSTree, and directory
+artifacts.
+
+Resolvers are looked up per artifact URI via a resolver registry. There are
+two layers of registry:
+
+* The process-global ``RESOLVER_FOR_URI_SCHEME`` dictionary lets callers
+  pre-register custom URI scheme resolvers. It is only read, never mutated,
+  while artifacts are recorded.
+* Each call to ``in_toto.runlib.record_artifacts_as_dict`` runs inside a
+  :class:`resolver_registry` context, which binds a *per-call* registry in a
+  :class:`contextvars.ContextVar`. The per-call registry is a copy of the
+  global registry with the call's configured ``file``, ``ostree`` and ``dir``
+  resolvers overlaid.
+
+Because the per-call registry and the resolver configuration live in a
+context variable instead of in process-global state:
+
+* concurrent calls in different threads (or asyncio tasks) cannot overwrite
+  each other's resolvers, base paths or other configuration;
+* nested calls, e.g. a custom resolver that itself records artifacts, push
+  their own registry and restore the outer one when they return;
+* the process-global registry, including custom scheme resolvers registered
+  by the caller, is preserved across calls, including calls that fail.
+
+The resolvers in this module additionally avoid changing the process
+working directory: paths are resolved relative to a resolver's configured
+``base_path`` instead. This makes interleaved calls with different
+workspaces independent and guarantees that the working directory is
+unchanged when a call returns or raises.
+"""
+
+import contextvars
 import locale
 import logging
 import os
 from abc import ABCMeta, abstractmethod
+from contextlib import contextmanager
 from functools import cmp_to_key
 from itertools import combinations
-from os.path import exists, isdir, isfile, join, normpath
+from os.path import exists, isdir, isfile, join, normpath, relpath
 
 from pathspec import GitIgnoreSpec
 from securesystemslib.hash import digest, digest_filename
@@ -18,7 +52,63 @@ logger = logging.getLogger(__name__)
 
 _HASH_ALGORITHM = "sha256"
 
+#: Process-global registry of resolver instances keyed by URI scheme.
+#:
+#: Callers may pre-register resolvers for custom URI schemes here. The
+#: dictionary is never modified while artifacts are being recorded; per-call
+#: configuration is kept in a separate, context-bound registry (see
+#: :class:`resolver_registry` and :class:`Resolver`).
 RESOLVER_FOR_URI_SCHEME = {}
+
+# Context bound registry used while artifacts are recorded. A ``None`` value
+# means that no recording context is active and the process-global registry
+# is used. Context variables are natively isolated per thread and per nested
+# ``contextvars.copy_context``/``asyncio`` task, so interleaved and nested
+# calls never see each other's resolvers.
+_CONTEXT_REGISTRY = contextvars.ContextVar(
+    "in_toto_resolver_registry", default=None
+)
+
+
+def _current_registry():
+    """Return the active resolver registry.
+
+    The context-bound per-call registry takes precedence while a recording
+    context is active; otherwise the process-global registry is returned.
+    """
+    registry = _CONTEXT_REGISTRY.get()
+    if registry is None:
+        return RESOLVER_FOR_URI_SCHEME
+    return registry
+
+
+@contextmanager
+def resolver_registry(resolvers=None):
+    """Bind a per-call resolver registry for the duration of a recording call.
+
+    The new registry starts as a copy of the currently active registry (or
+    the process-global :data:`RESOLVER_FOR_URI_SCHEME`), so custom scheme
+    resolvers registered by the caller remain available. Passed ``resolvers``
+    are overlaid on top of the copy.
+
+    On exit, including when an exception is raised, the previously active
+    registry is restored. Nested contexts are supported: an inner recording
+    call (e.g. from within a custom resolver) does not affect the outer
+    call's registry.
+
+    The context is bound with :class:`contextvars.ContextVar`, which makes
+    each thread and each nested context see its own registry without any
+    process-global locking.
+    """
+    registry = dict(_current_registry())
+    if resolvers:
+        registry.update(resolvers)
+
+    token = _CONTEXT_REGISTRY.set(registry)
+    try:
+        yield registry
+    finally:
+        _CONTEXT_REGISTRY.reset(token)
 
 
 class Resolver(metaclass=ABCMeta):
@@ -26,13 +116,19 @@ class Resolver(metaclass=ABCMeta):
 
     @classmethod
     def for_uri(cls, uri):
-        """Return registered resolver instance for passed URI."""
+        """Return registered resolver instance for passed URI.
+
+        Lookup uses the context-bound per-call registry when recording is in
+        progress, and falls back to the process-global
+        :data:`RESOLVER_FOR_URI_SCHEME` otherwise.
+        """
         scheme, match, _ = uri.partition(":")
 
-        if not match or scheme not in RESOLVER_FOR_URI_SCHEME:
+        registry = _current_registry()
+        if not match or scheme not in registry:
             scheme = FileResolver.SCHEME
 
-        return RESOLVER_FOR_URI_SCHEME[scheme]
+        return registry[scheme]
 
     @abstractmethod
     def hash_artifacts(self, uris):
@@ -45,6 +141,10 @@ class FileResolver(Resolver):
 
     Provides a ``hash_artifacts`` method to generate hashes for passed file
     paths. The resolver is configurable via its constructor.
+
+    Paths are resolved relative to ``base_path`` without changing the
+    process working directory, so resolver instances with different base
+    paths can be used concurrently in the same process.
 
     """
 
@@ -67,6 +167,14 @@ class FileResolver(Resolver):
         if base_path is not None:
             if not isinstance(base_path, str):
                 raise ValueError("'base_path' must be string")
+            # Preserve the failure that a working directory change used to
+            # produce when the base path cannot be entered. Checking here
+            # also fails early before any artifact is read, without touching
+            # the process working directory.
+            if not isdir(base_path):
+                raise OSError(
+                    f"[Errno 2] No such file or directory: '{base_path}'"
+                )
 
         for name, val in [
             ("exclude_patterns", exclude_patterns),
@@ -91,6 +199,27 @@ class FileResolver(Resolver):
         self._follow_symlink_dirs = follow_symlink_dirs
         self._normalize_line_endings = normalize_line_endings
         self._lstrip_paths = lstrip_paths
+
+    def _resolve(self, path):
+        """Return filesystem path for ``path`` relative to the base path.
+
+        The working directory is not changed. Relative paths are interpreted
+        relative to this resolver's ``base_path`` (the current working
+        directory if no base path is configured).
+        """
+        if self._base_path:
+            return join(self._base_path, path)
+        return path
+
+    def _display_path(self, fs_path):
+        """Return the artifact name for a resolved filesystem path.
+
+        Reverses :meth:`_resolve` so that the base path never appears in the
+        returned dictionary keys.
+        """
+        if self._base_path:
+            return relpath(fs_path, self._base_path)
+        return fs_path
 
     def _exclude(self, path):
         """Helper to check, if path matches pre-compiled exclude patterns."""
@@ -143,10 +272,6 @@ class FileResolver(Resolver):
     def hash_artifacts(self, uris):
         hashes = {}
 
-        if self._base_path:
-            original_cwd = os.getcwd()
-            os.chdir(self._base_path)
-
         for path in uris:
             # Remove scheme prefix, but preserver to re-add later (see _mangle)
             path, prefix = self._strip_scheme_prefix(path)
@@ -160,17 +285,22 @@ class FileResolver(Resolver):
             if self._exclude(path):
                 continue
 
-            if not exists(path):
+            # Resolve relative to this resolver's base path. Unlike a working
+            # directory change, this is local to the resolver instance and
+            # therefore safe for interleaved calls with different workspaces.
+            fs_path = self._resolve(path)
+
+            if not exists(fs_path):
                 logger.info("path: %s does not exist, skipping..", path)
                 continue
 
-            if isfile(path):
+            if isfile(fs_path):
                 name = self._mangle(path, hashes, prefix)
-                hashes[name] = self._hash(path)
+                hashes[name] = self._hash(fs_path)
 
-            if isdir(path):
+            if isdir(fs_path):
                 for base, dirs, names in os.walk(
-                    path, followlinks=self._follow_symlink_dirs
+                    fs_path, followlinks=self._follow_symlink_dirs
                 ):
                     # Filter directories to avoid unnecessary recursion below
                     # NOTE: Normalize to filter on directory paths without
@@ -178,18 +308,21 @@ class FileResolver(Resolver):
                     dirs[:] = [
                         dirname
                         for dirname in dirs
-                        if not self._exclude(normpath(join(base, dirname)))
+                        if not self._exclude(
+                            normpath(self._display_path(join(base, dirname)))
+                        )
                     ]
 
                     for filename in names:
                         # NOTE: Normalize to filter on and return file paths
                         # without their dot-slash prefix, if path was dot.
-                        filepath = normpath(join(base, filename))
+                        fs_filepath = join(base, filename)
+                        filepath = normpath(self._display_path(fs_filepath))
 
                         if self._exclude(filepath):
                             continue
 
-                        if not isfile(filepath):
+                        if not isfile(fs_filepath):
                             logger.info(
                                 "File '%s' appears to be a broken symlink. "
                                 "Skipping...",
@@ -198,11 +331,7 @@ class FileResolver(Resolver):
                             continue
 
                         name = self._mangle(filepath, hashes, prefix)
-                        hashes[name] = self._hash(filepath)
-
-        # Change back to original current working dir
-        if self._base_path:
-            os.chdir(original_cwd)
+                        hashes[name] = self._hash(fs_filepath)
 
         return hashes
 
@@ -229,17 +358,27 @@ class OSTreeResolver(Resolver):
 
         return f"{self.SCHEME}:{path}"
 
+    def _resolve(self, path):
+        """Return filesystem path relative to the base path, no chdir."""
+        if self._base_path:
+            return join(self._base_path, path)
+        return path
+
     def _hash(self, path):
         """Helper to hash OSTree commits."""
 
-        ref_path = os.path.join("refs", "heads", path)
+        ref_path = self._resolve(join("refs", "heads", path))
 
         with open(ref_path, "r") as ref:  # pylint: disable=unspecified-encoding
             ref_contents = ref.read()
         ref_contents = ref_contents.strip("\n")
 
-        object_path = os.path.join(
-            "objects", ref_contents[:2], f"{ref_contents[2:]}.commit"
+        object_path = self._resolve(
+            join(
+                "objects",
+                ref_contents[:2],
+                f"{ref_contents[2:]}.commit",
+            )
         )
 
         digest_obj = digest_filename(
@@ -252,18 +391,10 @@ class OSTreeResolver(Resolver):
     def hash_artifacts(self, uris):
         hashes = {}
 
-        if self._base_path:
-            original_cwd = os.getcwd()
-            os.chdir(self._base_path)
-
         for path in uris:
             # Remove scheme prefix, but preserver to re-add later
             path = self._strip_scheme_prefix(path)
             hashes[self._add_scheme_prefix(path)] = self._hash(path)
-
-        # Change back to original current working dir
-        if self._base_path:
-            os.chdir(original_cwd)
 
         return hashes
 
@@ -280,6 +411,12 @@ class DirectoryResolver(Resolver):
     `hash_artifacts`, but on the files inside the directory. Similarly,
     `follow_symlink_dirs` and `normalize_line_endings` are used on
     subdirectories and files inside the directories passed to `hash_artifacts`.
+
+    Directory URIs are resolved as given (relative to the process working
+    directory when no base path is configured) and the inner file resolver
+    receives the directory as its base path. No working directory change is
+    performed, so multiple directory resolver calls with different roots can
+    run concurrently in the same process.
 
     """
 
@@ -340,8 +477,16 @@ class DirectoryResolver(Resolver):
         text_repr = ""
         keys = list(file_hashes.keys())
         if keys:
-            locale.setlocale(locale.LC_ALL, "C")
-            keys.sort(key=cmp_to_key(locale.strcoll))
+            # Sorting requires the C locale. setlocale is process-global, so
+            # restore the previous locale as soon as the sort is done. This
+            # keeps the locale change from leaking into other interleaved
+            # calls.
+            old_locale = locale.setlocale(locale.LC_ALL)
+            try:
+                locale.setlocale(locale.LC_ALL, "C")
+                keys.sort(key=cmp_to_key(locale.strcoll))
+            finally:
+                locale.setlocale(locale.LC_ALL, old_locale)
 
             text_repr = "\n".join(
                 [f"{file_hashes[k][_HASH_ALGORITHM]}  {k}" for k in keys]
@@ -362,6 +507,11 @@ class DirectoryResolver(Resolver):
             if not os.path.isdir(path):
                 raise ValueError(f"path '{path}' is not a directory")
 
+            # The inner file resolver is bound to this directory root. It
+            # resolves everything relative to that root without a working
+            # directory change, so swapping the directory's contents (or
+            # passing a different root) directly changes this aggregate hash
+            # and cannot be influenced by another call's workspace.
             file_resolver = FileResolver(
                 base_path=path,
                 exclude_patterns=self._exclude_patterns,

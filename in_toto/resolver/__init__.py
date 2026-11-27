@@ -13,6 +13,12 @@ Example usage::
     resolver = Resolver.for_uri(uri)
     artifact_hashes = resolver.hash_artifacts(uris)
 
+Resolvers registered here remain available to every
+``in_toto.runlib.record_artifacts_as_dict`` call: recording binds a private,
+per-call copy of this registry (see ``resolver_registry``) instead of
+mutating it, so registrations never need to be repeated and survive failed
+and interleaved calls.
+
 """
 
 from in_toto.resolver._resolver import (
@@ -21,4 +27,5 @@ from in_toto.resolver._resolver import (
     FileResolver,
     OSTreeResolver,
     Resolver,
+    resolver_registry,
 )

@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Changed
+* `record_artifacts_as_dict` no longer mutates the process-global
+  `RESOLVER_FOR_URI_SCHEME` registry or the process working directory.
+  Per-call resolver configuration is bound in a context-local registry
+  (`in_toto.resolver.resolver_registry`, based on `contextvars`) and
+  artifact paths are resolved relative to `base_path` via path joins, so
+  concurrent and nested calls with different workspaces cannot leak
+  resolver configuration, working directory, exclude patterns, prefix
+  stripping, line-ending normalization or symlink handling into each
+  other. Custom resolvers pre-registered in `RESOLVER_FOR_URI_SCHEME`
+  remain available to every call and are preserved after failed calls.
+  Single-threaded, non-nested recording results are unchanged.
+
 ### Added
 * Optional `grouped` layout threshold mode (`threshold_mode`): links with
   conflicting artifacts may coexist; verification searches for one

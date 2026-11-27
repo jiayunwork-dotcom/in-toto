@@ -55,11 +55,11 @@ from in_toto.models.link import (
 )
 from in_toto.models.metadata import Envelope, Metablock, Metadata
 from in_toto.resolver import (
-    RESOLVER_FOR_URI_SCHEME,
     DirectoryResolver,
     FileResolver,
     OSTreeResolver,
     Resolver,
+    resolver_registry,
 )
 
 # Inherits from in_toto base logger (c.f. in_toto.log)
@@ -146,6 +146,15 @@ def record_artifacts_as_dict(
     <Side Effects>
       Calls functions to generate cryptographic hashes.
 
+      The per-call resolver configuration is bound in a context-local
+      registry (see ``in_toto.resolver.resolver_registry``) and artifact
+      paths are resolved relative to ``base_path`` without changing the
+      process working directory. Therefore interleaved (including
+      multi-threaded) and nested calls do not affect each other, and
+      resolvers pre-registered in ``RESOLVER_FOR_URI_SCHEME`` as well as the
+      working directory remain unchanged after the call, whether it succeeds
+      or raises.
+
     <Returns>
       A dictionary with file paths as keys and the files' hashes as values.
 
@@ -161,45 +170,42 @@ def record_artifacts_as_dict(
     if not exclude_patterns:
         exclude_patterns = in_toto.settings.ARTIFACT_EXCLUDE_PATTERNS
 
-    # Configure resolver with resolver specific arguments
-    # FIXME: This should happen closer to the user boundary, where
-    # resolver-specific config arguments are passed and global state is managed.
-    RESOLVER_FOR_URI_SCHEME[FileResolver.SCHEME] = FileResolver(
-        exclude_patterns,
-        base_path,
-        follow_symlink_dirs,
-        normalize_line_endings,
-        lstrip_paths,
-    )
+    # Configure the resolvers for this call with the resolver specific
+    # arguments. The resolvers are bound to a private, context-local copy of
+    # RESOLVER_FOR_URI_SCHEME (see resolver_registry): pre-registered custom
+    # scheme resolvers stay available, while neither this call's
+    # configuration nor nested or interleaved calls leak into each other or
+    # into the process-global registry.
+    resolvers = {
+        FileResolver.SCHEME: FileResolver(
+            exclude_patterns,
+            base_path,
+            follow_symlink_dirs,
+            normalize_line_endings,
+            lstrip_paths,
+        ),
+        OSTreeResolver.SCHEME: OSTreeResolver(base_path),
+        DirectoryResolver.SCHEME: DirectoryResolver(
+            exclude_patterns=exclude_patterns,
+            follow_symlink_dirs=follow_symlink_dirs,
+            normalize_line_endings=normalize_line_endings,
+            lstrip_paths=lstrip_paths,
+        ),
+    }
 
-    # Configure resolver for OSTree
-    RESOLVER_FOR_URI_SCHEME[OSTreeResolver.SCHEME] = OSTreeResolver(base_path)
+    with resolver_registry(resolvers):
+        # Aggregate artifacts per resolver
+        resolver_for_uris = defaultdict(list)
+        for artifact in artifacts:
+            resolver = Resolver.for_uri(artifact)
+            resolver_for_uris[resolver].append(artifact)
 
-    # Configure resolver for hashing directories as a single entry
-    RESOLVER_FOR_URI_SCHEME[DirectoryResolver.SCHEME] = DirectoryResolver(
-        exclude_patterns=exclude_patterns,
-        follow_symlink_dirs=follow_symlink_dirs,
-        normalize_line_endings=normalize_line_endings,
-        lstrip_paths=lstrip_paths,
-    )
-
-    # Aggregate artifacts per resolver
-    resolver_for_uris = defaultdict(list)
-    for artifact in artifacts:
-        resolver = Resolver.for_uri(artifact)
-        resolver_for_uris[resolver].append(artifact)
-
-    # Hash artifacts in a batch per resolver
-    # FIXME: The behavior may change if we hash each artifact individually,
-    # because the left-prefix duplicate check in FileResolver only works for the
-    # artifacts hashed in one batch.
-    for resolver, uris in resolver_for_uris.items():
-        artifact_hashes.update(resolver.hash_artifacts(uris))
-
-    # Clear resolvers to not preserve global state change beyond this function.
-    # FIXME: This also clears resolver registered elsewhere. For now we
-    # assume that we only modify RESOLVER_FOR_URI_SCHEME in this function.
-    RESOLVER_FOR_URI_SCHEME.clear()
+        # Hash artifacts in a batch per resolver
+        # FIXME: The behavior may change if we hash each artifact individually,
+        # because the left-prefix duplicate check in FileResolver only works
+        # for the artifacts hashed in one batch.
+        for resolver, uris in resolver_for_uris.items():
+            artifact_hashes.update(resolver.hash_artifacts(uris))
 
     return artifact_hashes
 
